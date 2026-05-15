@@ -1,0 +1,223 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiMulti.h>
+WiFiMulti wifiMulti; // Creates the multi-network scanner
+#include <WiFiClientSecure.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include "ThingSpeak.h"
+#include "time.h"
+
+// ================= USER SETTINGS =================
+
+// 1. WI-FI CREDENTIALS
+#define WIFI_SSID_1      "XXXX"       
+#define WIFI_PASSWORD_1  "XXXX"   
+
+#define WIFI_SSID_2      "XXXX"       
+#define WIFI_PASSWORD_2  "XXXX"   
+
+// 2. TELEGRAM SETTINGS
+#define BOTtoken       "XXXX" 
+#define CHAT_ID        "XXXX"     
+
+// 3. THINGSPEAK SETTINGS
+unsigned long myChannelNumber = XXXX;           // Channel ID
+const char * myWriteAPIKey = "XXXX";    // Write API Key
+
+// 4. PRESENTATION TIMER
+int reportIntervalMinutes = 2; // Set to 2 minutes
+
+// 5. TIME SETTINGS (India IST)
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 19800;      
+const int   daylightOffset_sec = 0;     
+
+// =====================================================================
+
+// --- PIN DEFINITIONS ---
+#define PIN_SDA 21     
+#define PIN_SCL 22     
+#define PIN_RAIN 34    
+#define PIN_MQ135 35   
+
+// --- OBJECTS & VARIABLES ---
+Adafruit_BME280 bme;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+WiFiClient client;
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOTtoken, secured_client);
+
+float previousPressure = 0;
+unsigned long lastPredictionTime = 0;
+unsigned long lastThingSpeakTime = 0;
+unsigned long lastTelegramTime = 0;
+unsigned long lastReportTime = 0; 
+
+String forecastState = "Analyzing...";
+String aqiStatus = "Fresh Air";   
+int rainProbability = 0;
+int rainThreshold = 2500; 
+
+void setup() {
+  Serial.begin(115200);
+  
+  // 1. Start Sensors
+  Wire.begin(PIN_SDA, PIN_SCL);
+  if (!bme.begin(0x76)) { 
+    if (!bme.begin(0x77)) {
+      Serial.println("Error: BME280 not found!");
+    }
+  }
+
+  // 2. Start Display
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Error: OLED not found!");
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0,10);
+  display.println("System Booting...");
+  display.display();
+
+  // 3. Connect to Wi-Fi
+  wifiMulti.addAP(WIFI_SSID_1, WIFI_PASSWORD_1); // Home Wi-Fi
+  wifiMulti.addAP(WIFI_SSID_2, WIFI_PASSWORD_2); // University Wi-Fi
+
+  Serial.print("Searching for known Wi-Fi networks");
+  display.clearDisplay();
+  display.setCursor(0, 10);
+  display.println("Scanning Wi-Fi...");
+  display.display();
+
+  
+  while (wifiMulti.run() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("\nWi-Fi Connected!");
+  Serial.print("Successfully connected to: ");
+  Serial.println(WiFi.SSID()); // Prints exactly which network it chose
+  
+  // 4. Initialize IoT & Time
+  secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  ThingSpeak.begin(client);
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Initialize Pressure History
+  previousPressure = bme.readPressure() / 100.0F;
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // ================= 1. READ SENSORS =================
+  float temp = bme.readTemperature();
+  float hum = bme.readHumidity();
+  float pres = bme.readPressure() / 100.0F;
+  int rainValue = analogRead(PIN_RAIN);      
+  int airQuality = analogRead(PIN_MQ135);    
+
+  // ================= 2. ZAMBRETTI & LOGIC =================
+  if (currentMillis - lastPredictionTime > 60000) {
+    float pressureDiff = pres - previousPressure;
+    
+    // Zambretti Logic
+    if (pressureDiff > 0.5) { forecastState = "Sunny/Stable"; rainProbability = 10; } 
+    else if (pressureDiff < -0.5) { forecastState = "Storm Alert"; rainProbability = 70; } 
+    else { forecastState = "Steady/Cloudy"; rainProbability = 30; }
+
+    // Humidity Correction
+    if (hum > 85) rainProbability += 25;
+    else if (hum < 40) rainProbability -= 25;
+    rainProbability = constrain(rainProbability, 0, 100);
+
+    // AQS Logic
+    if (airQuality < 1500) aqiStatus = "Fresh Air";
+    else if (airQuality < 2500) aqiStatus = "Poor Quality";
+    else aqiStatus = "Toxic/Danger";
+
+    previousPressure = pres;
+    lastPredictionTime = currentMillis;
+  }
+
+  // ================= 3. OLED DISPLAY =================
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+
+  // Cycle every 9000ms (9 seconds total cycle)
+  unsigned long timer = currentMillis % 9000;
+
+  display.clearDisplay();
+  
+  // PAGE 1: WEATHER (0-3s)
+  if (timer < 3000) {
+    display.setCursor(0,0);
+    display.printf("%02d/%02d %02d:%02d", timeinfo.tm_mday, timeinfo.tm_mon+1, timeinfo.tm_hour, timeinfo.tm_min);
+    display.drawLine(0, 10, 127, 10, WHITE);
+    display.setCursor(0,15); display.print("Temp: "); display.print(temp); display.println(" C");
+    display.setCursor(0,25); display.print("Hum:  "); display.print(hum); display.println(" %");
+    display.setCursor(0,35); display.print("Rain: "); 
+    if(rainValue < rainThreshold) display.println("YES!"); else display.println("NO");
+  }
+  // PAGE 2: FORECAST (3-6s)
+  else if (timer < 6000) {
+    display.setCursor(0,0); display.println("--- ANALYSIS ---");
+    display.drawLine(0, 10, 127, 10, WHITE); 
+    display.setCursor(0,15); display.print("Pres: "); display.print(pres); display.println(" hPa");
+    display.setCursor(0,25); display.print("Fcst: "); display.println(forecastState);
+    display.setCursor(0,35); display.print("Prob: "); display.print(rainProbability); display.println("%");
+  }
+  // PAGE 3: AIR QUALITY (6-9s) -- NEW!
+  else {
+    display.setCursor(0,0); display.println("--- AIR QUALITY ---");
+    display.drawLine(0, 10, 127, 10, WHITE); 
+    display.setCursor(0,20); display.setTextSize(2); display.print("AQS:"); display.println(airQuality);
+    display.setTextSize(1);
+    display.setCursor(0,45); display.print("Status: "); display.println(aqiStatus);
+  }
+  display.display();
+
+  // ================= 4. THINGSPEAK =================
+  if (currentMillis - lastThingSpeakTime > 20000) {
+    ThingSpeak.setField(1, temp);
+    ThingSpeak.setField(2, hum);
+    ThingSpeak.setField(3, pres);
+    ThingSpeak.setField(4, rainProbability);
+    ThingSpeak.setField(5, airQuality); 
+    
+    // Send Text Status
+    String statusMsg = "Forecast: " + forecastState + " | AQS: " + aqiStatus;
+    ThingSpeak.setStatus(statusMsg);
+    
+    ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+    lastThingSpeakTime = currentMillis;
+  }
+
+  // ================= 5. TELEGRAM: INSTANT ALERTS =================
+  // ALERT 1: Physical Rain (Instant)
+  if (rainValue < rainThreshold && (currentMillis - lastTelegramTime > 60000)) {
+    String msg = "⚠️ RAIN ALERT!\nIt is raining at the station.\nTime: " + String(timeinfo.tm_hour) + ":" + String(timeinfo.tm_min);
+    bot.sendMessage(CHAT_ID, msg, "");
+    lastTelegramTime = currentMillis;
+  }
+
+  // ================= 6. TELEGRAM: PERIODIC REPORT (Timer) =================
+  if (currentMillis - lastReportTime > (reportIntervalMinutes * 60000)) {
+    String msg = "📊 *Periodic Report*\n";
+    msg += "Temp: " + String(temp) + " C\n";
+    msg += "Hum: " + String(hum) + " %\n";
+    msg += "Rain Prob: " + String(rainProbability) + " %\n";
+    msg += "AQS: " + String(airQuality) + " (" + aqiStatus + ")";
+    
+    bot.sendMessage(CHAT_ID, msg, "Markdown");
+    Serial.println("Periodic Report Sent");
+    lastReportTime = currentMillis;
+  }
+}
